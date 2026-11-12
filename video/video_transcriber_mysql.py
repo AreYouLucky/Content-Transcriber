@@ -8,6 +8,8 @@ Behavior:
   - If HoldingsID is absent, search starbooks_old.tblmultimedia.Filename
     using the ORIGINAL filename (including .dat/.mp4/etc), and use the
     HoldingsID found there to look up starbooks.records.
+  - If still not found, match the ORIGINAL filename against
+    starbooks.records.content_file.
   - Transcribe audio directly with Faster-Whisper (including .dat containers
     supported by FFmpeg/PyAV); do NOT extract video frame text.
   - Only after a nonempty, successful transcription, update
@@ -54,7 +56,7 @@ LOGGER = logging.getLogger("starbooks_video_transcriber")
 class PendingVideo:
     file: Path
     holdings_id: Any
-    source: str  # 'records' or 'starbooks_old.tblmultimedia'
+    source: str  # 'records', 'starbooks_old.tblmultimedia', or 'records.content_file'
 
 
 def safe_identifier(name: str) -> str:
@@ -115,6 +117,19 @@ def get_record(conn, schema: str, holdings_id: Any):
         cursor.close()
 
 
+def get_records_by_content_file(conn, schema: str, filename: str) -> list:
+    sql = (
+        f"SELECT `HoldingsID`, `is_transcribe` "
+        f"FROM {schema}.`records` WHERE `content_file` = %s LIMIT 2"
+    )
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(sql, (filename,))
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+
+
 def resolve_video(conn, filename: str, stem: str, schema: str, old_schema: str):
     """Return (status, HoldingsID, source).
 
@@ -138,16 +153,24 @@ def resolve_video(conn, filename: str, stem: str, schema: str, old_schema: str):
         finally:
             cursor.close()
 
-        if not matches:
-            return "unmatched", None, None
         if len(matches) > 1:
             # Multiple candidates are unsafe to choose arbitrarily.
             return "ambiguous", None, None
 
-        record = get_record(conn, schema, matches[0])
-        source = "starbooks_old.tblmultimedia"
+        if matches:
+            record = get_record(conn, schema, matches[0])
+            source = "starbooks_old.tblmultimedia"
+
         if record is None:
-            return "unmatched", None, None
+            # Final fallback: match the original filename against
+            # records.content_file.
+            content_matches = get_records_by_content_file(conn, schema, filename)
+            if not content_matches:
+                return "unmatched", None, None
+            if len(content_matches) > 1:
+                return "ambiguous", None, None
+            record = content_matches[0]
+            source = "records.content_file"
 
     if record["is_transcribe"] is not None and int(record["is_transcribe"]) == 1:
         return "already_done", record["HoldingsID"], source
@@ -305,10 +328,10 @@ def main(argv=None) -> int:
                 LOGGER.info("[%d/%d] SKIP (is_transcribe=1) %s => HoldingsID %s", i, len(files), file.name, holdings_id)
             elif status == "unmatched":
                 stats["unmatched"] += 1
-                LOGGER.warning("[%d/%d] UNMATCHED %s: no matching HoldingsID in records/legacy", i, len(files), file.name)
+                LOGGER.warning("[%d/%d] UNMATCHED %s: no matching HoldingsID in records/legacy/content_file", i, len(files), file.name)
             elif status == "ambiguous":
                 stats["ambiguous"] += 1
-                LOGGER.warning("[%d/%d] AMBIGUOUS %s: legacy Filename maps to multiple HoldingsIDs", i, len(files), file.name)
+                LOGGER.warning("[%d/%d] AMBIGUOUS %s: legacy Filename or content_file maps to multiple HoldingsIDs", i, len(files), file.name)
             else:
                 key = str(holdings_id)
                 if key in queued_ids:
