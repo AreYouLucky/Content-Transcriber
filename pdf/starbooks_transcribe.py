@@ -5,7 +5,8 @@
 - Each subfolder containing documents is one record; root documents are grouped
   by the filename portion preceding the first dot.
 - Resolves HoldingsID first via starbooks.records, then (if necessary) via
-  starbooks_old.tblmultimedia.Filename.
+  starbooks_old.tblmultimedia.Filename, and finally via
+  starbooks.records.content_file.
 - Never extracts or overwrites a record that is already is_transcribe=1.
 - Reads PDF text with PyMuPDF and pypdf; automatically OCRs scanned pages.
 - Saves text_conversion and is_transcribe=1 in a single protected UPDATE.
@@ -615,7 +616,8 @@ def mysql_connect(args: argparse.Namespace):
 
 def assert_schema(conn) -> None:
     with conn.cursor() as cur:
-        cur.execute("SELECT HoldingsID, is_transcribe, text_conversion FROM starbooks.records LIMIT 0")
+        cur.execute("SELECT HoldingsID, is_transcribe, text_conversion, content_file "
+                    "FROM starbooks.records LIMIT 0")
         cur.execute("SELECT Filename, HoldingsID FROM starbooks_old.tblmultimedia LIMIT 0")
 
 
@@ -644,6 +646,19 @@ def lookup_old_id(conn, filename: str) -> str | None:
     return next(iter(ids)) if ids else None
 
 
+def lookup_record_by_content_file(conn, filename: str) -> dict | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT HoldingsID, is_transcribe FROM starbooks.records "
+            "WHERE content_file = %s LIMIT 2", (filename,)
+        )
+        rows = cur.fetchall()
+    if len(rows) > 1:
+        raise DatabaseMatchError(f"ambiguous content_file: {filename} -> "
+                                 f"{sorted(str(row['HoldingsID']) for row in rows)}")
+    return rows[0] if rows else None
+
+
 def resolve_record(conn, job: Job) -> tuple[dict | None, str]:
     """Return record and lookup source, trying file names only on initial miss."""
     record = lookup_record(conn, job.candidate_id)
@@ -670,7 +685,25 @@ def resolve_record(conn, job: Job) -> tuple[dict | None, str]:
             return record, f"legacy ({matched_filename})"
         LOGGER.warning("%s: legacy ID %s missing from starbooks.records",
                        job.label, recovered_id)
-    return None, "not found in primary/legacy tables"
+
+    # Final fallback: match file names against starbooks.records.content_file.
+    content_ids: set[str] = set()
+    content_records: dict[str, dict] = {}
+    matched_filename = ""
+    for file in job.files:
+        record = lookup_record_by_content_file(conn, file.name)
+        if record:
+            holdings_id = str(record["HoldingsID"]).strip()
+            content_ids.add(holdings_id)
+            content_records[holdings_id] = record
+            matched_filename = file.name
+    if len(content_ids) > 1:
+        raise DatabaseMatchError(
+            f"conflicting content_file IDs for {job.label}: {sorted(content_ids)}"
+        )
+    if content_ids:
+        return content_records[next(iter(content_ids))], f"content_file ({matched_filename})"
+    return None, "not found in primary/legacy/content_file tables"
 
 
 def is_completed(record: dict) -> bool:
