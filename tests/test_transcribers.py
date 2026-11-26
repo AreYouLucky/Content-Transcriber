@@ -27,6 +27,7 @@ def load_module(name, relative_path):
 
 pdf = load_module("pdf_transcriber", "pdf/starbooks_transcribe.py")
 video = load_module("video_transcriber", "video/video_transcriber_mysql.py")
+audio = load_module("audio_transcriber", "audio/audio_transcriber_mysql.py")
 
 
 class SQLiteCursor:
@@ -91,6 +92,7 @@ class GuardedWriteTests(unittest.TestCase):
         return (
             lambda content: pdf.update_record(self.conn, "BOOK", content),
             lambda content: video.save_transcript(self.conn, "`starbooks`", "BOOK", content),
+            lambda content: audio.save_transcript(self.conn, "`starbooks`", "BOOK", content),
         )
 
     def test_success_commits_text_and_completion(self):
@@ -101,7 +103,7 @@ class GuardedWriteTests(unittest.TestCase):
                 self.assertEqual(writer("new transcript"), 1)
                 self.assertEqual(self.conn.rows(), [("new transcript", 1)])
                 self.assertFalse(self.conn.database.in_transaction)
-        self.assertEqual(self.conn.ping.call_count, 2)
+        self.assertEqual(self.conn.ping.call_count, len(self.writers()))
 
     def test_completed_record_is_never_overwritten(self):
         self.conn.insert(1)
@@ -177,6 +179,33 @@ class MatchingTests(unittest.TestCase):
         with patch.object(video, "get_record", return_value=None):
             self.assertEqual(video.resolve_video(conn, "file.dat", "file", "s", "old")[0], "ambiguous")
 
+    @staticmethod
+    def audio_conn(rows):
+        conn = Mock()
+        conn.cursor.return_value.fetchall.return_value = rows
+        return conn
+
+    def test_audio_matches_by_holdings_id_only(self):
+        conn = self.audio_conn([{"HoldingsID": "ABC-1", "is_transcribe": 0}])
+        self.assertEqual(audio.resolve_audio(conn, "ABC-1", "`starbooks`"), ("pending", "ABC-1"))
+        sql, params = conn.cursor.return_value.execute.call_args.args
+        self.assertIn("`HoldingsID` = %s", sql)
+        self.assertNotIn("tblmultimedia", sql)
+        self.assertNotIn("content_file", sql)
+        self.assertEqual(params, ("ABC-1",))
+        conn.cursor.return_value.close.assert_called_once()
+
+    def test_audio_resolution_statuses(self):
+        cases = (
+            ([], ("unmatched", None)),
+            ([{"HoldingsID": "A", "is_transcribe": 0}] * 2, ("ambiguous", None)),
+            ([{"HoldingsID": "A", "is_transcribe": 1}], ("already_done", "A")),
+            ([{"HoldingsID": "A", "is_transcribe": None}], ("pending", "A")),
+        )
+        for rows, expected in cases:
+            with self.subTest(rows=rows):
+                self.assertEqual(audio.resolve_audio(self.audio_conn(rows), "A", "s"), expected)
+
 
 class ExtractionTests(unittest.TestCase):
     def test_pdf_pages_grouped_in_numeric_order(self):
@@ -220,9 +249,24 @@ class ExtractionTests(unittest.TestCase):
             video.transcribe(model, Path("bad.dat"), "en", 5, True)
 
 
+    def test_audio_scan_keeps_audio_and_dat_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for name in ("B.dat", "A.MP3", "C.wav", "notes.txt", "doc.pdf"):
+                (root / name).touch()
+            (root / "sub").mkdir()
+            (root / "sub" / "D.dat").touch()
+            self.assertEqual([p.name for p in audio.scan_media(root, False)], ["A.MP3", "B.dat", "C.wav"])
+            self.assertIn("D.dat", [p.name for p in audio.scan_media(root, True)])
+
+    def test_audio_missing_folder_is_reported(self):
+        with self.assertRaises(NotADirectoryError):
+            audio.scan_media(Path(tempfile.gettempdir()) / "no-such-audio-folder-xyz", False)
+
+
 class ArgumentTests(unittest.TestCase):
     def test_invalid_ports_report_cli_error_without_traceback(self):
-        for module, variable in ((pdf, "STARBOOKS_DB_PORT"), (video, "MYSQL_PORT")):
+        for module, variable in ((pdf, "STARBOOKS_DB_PORT"), (video, "MYSQL_PORT"), (audio, "MYSQL_PORT")):
             for value in ("invalid", "0", "65536"):
                 with self.subTest(module=module.__name__, value=value), patch.dict(
                     os.environ, {variable: value}
@@ -240,6 +284,8 @@ class ArgumentTests(unittest.TestCase):
     def test_video_rejects_unsafe_schema_names(self):
         with self.assertRaises(ValueError):
             video.safe_identifier("starbooks; DROP TABLE records")
+        with self.assertRaises(ValueError):
+            audio.safe_identifier("starbooks; DROP TABLE records")
 
 
 if __name__ == "__main__":
